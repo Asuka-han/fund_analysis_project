@@ -9,7 +9,7 @@
 
 
 ## Version-v1.2
-- 发布日期：2026-01-29
+- 发布日期：2026-04-25
 
 ## 更新内容
 ### Added
@@ -45,7 +45,7 @@
 
 
 ## Version-v1.3
-- 发布日期：2026-02-05
+- 发布日期：2026-05-7
 
 ## 更新内容
 ### Added
@@ -78,3 +78,15 @@
     - 作用：控制日志输出格式。
     - 示例：`LOG_FORMAT=json`
     - 说明：默认文本格式，设置为 `json` 输出结构化日志。
+
+
+
+
+
+## Version-v1.4
+- 发布日期：2026-05-10
+
+## 更新内容
+### Added
+- 指数数据接口：在 `src/data_fetch/index_fetcher.py` 中补充 AKShare 指数历史数据兼容逻辑，A 股指数增加多接口回退与符号兼容（优先 `stock_zh_index_daily_em`，再回退到 `index_zh_a_hist`、`stock_zh_index_daily_tx`、`stock_zh_index_daily`），港股指数增加多接口回退（优先 `stock_hk_index_daily_sina`，再回退到 `stock_hk_index_daily_em`、`index_global_hist_em`），并统一做日期与收盘价字段清洗，降低接口变更和临时网络抖动造成的抓取失败。
+- 指数抓取日志：增加分支级日志输出，明确记录每个接口分支的尝试、命中和失败信息，便于快速定位当前抓取究竟落在哪个 AKShare 接口上。

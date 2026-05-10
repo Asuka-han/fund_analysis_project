@@ -23,6 +23,44 @@ def _supports_multiprocess_flag() -> bool:
         return False
 
 
+def _collect_windows_runtime_add_binary_args(data_sep: str) -> list[str]:
+    """Collect Windows numerical runtime DLLs (MKL/OpenMP) from conda env."""
+    if os.name != 'nt':
+        return []
+
+    env_roots = []
+    for root in (os.environ.get('CONDA_PREFIX'), sys.prefix, sys.base_prefix):
+        if root and root not in env_roots:
+            env_roots.append(root)
+
+    lib_bin_dirs = []
+    for root in env_roots:
+        candidate = Path(root) / 'Library' / 'bin'
+        if candidate.exists() and candidate.is_dir():
+            lib_bin_dirs.append(candidate)
+
+    patterns = [
+        'mkl*.dll',  
+        'libiomp5md.dll',
+        'tbb*.dll',
+        'svml_dispmd.dll',
+    ]
+
+    matched: list[str] = []
+    for lib_bin in lib_bin_dirs:
+        for pattern in patterns:
+            for dll in lib_bin.glob(pattern):
+                dll_str = str(dll)
+                if dll_str not in matched:
+                    matched.append(dll_str)
+
+    args: list[str] = []
+    for dll in matched:
+        args += ['--add-binary', f'{dll}{data_sep}.']
+
+    return args
+
+
 def build_with_pyinstaller():
     """使用PyInstaller构建所有脚本"""
     # 设置环境变量以解决PyInstaller conda metadata bug (KeyError: 'depends')
@@ -54,6 +92,8 @@ def build_with_pyinstaller():
         "--collect-all", "matplotlib",
         "--collect-all", "plotly",
         "--collect-all", "pandas",
+        "--collect-all", "numpy",
+        "--collect-all", "scipy",
         "--collect-all", "py_mini_racer",
         "--collect-submodules", "akshare",
         "--collect-data", "akshare",
@@ -62,9 +102,16 @@ def build_with_pyinstaller():
         "--hidden-import", "pytz",
         "--hidden-import", "dateutil.tz",
         "--copy-metadata", "pandas",
+        "--copy-metadata", "numpy",
+        "--copy-metadata", "scipy",
         "--copy-metadata", "plotly",
         "--copy-metadata", "matplotlib"
     ]
+
+    runtime_binary_args = _collect_windows_runtime_add_binary_args(data_sep)
+    if runtime_binary_args:
+        print(f"检测到 {len(runtime_binary_args)//2} 个 Windows 运行时 DLL，已加入打包参数")
+        common_args += runtime_binary_args
 
     if _supports_multiprocess_flag():
         common_args.insert(3, "--multiprocess")

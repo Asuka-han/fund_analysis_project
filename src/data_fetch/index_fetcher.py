@@ -10,6 +10,7 @@ import pandas as pd
 from datetime import datetime, timedelta
 import time
 import logging
+import re
 from typing import Dict, List, Optional, Tuple
 try:
     import config
@@ -51,6 +52,176 @@ class IndexDataFetcher:
             display_name = self.config.get_benchmark_display_name(normalized_code)
             return normalized_code, display_name
         return index_code, index_code
+
+    def _fetch_with_retries(self, fetcher, *args, retries: int = 3, delay: float = 0.8, **kwargs):
+        """统一重试封装，降低临时网络抖动对抓取成功率的影响。"""
+        last_error = None
+        for attempt in range(1, retries + 1):
+            try:
+                data = fetcher(*args, **kwargs)
+                if data is not None and not data.empty:
+                    return data
+            except Exception as e:
+                last_error = e
+                logger.warning(f"{fetcher.__name__} 第 {attempt}/{retries} 次调用失败: {e}")
+            if attempt < retries:
+                time.sleep(delay)
+        if last_error is not None:
+            raise last_error
+        return None
+
+    def _log_branch_attempt(self, market: str, normalized_code: str, branch_name: str, symbol: str):
+        """记录某个接口分支的尝试。"""
+        logger.warning(f"{market}指数 {normalized_code} 尝试 {branch_name}(symbol={symbol})")
+
+    def _log_branch_success(self, market: str, normalized_code: str, branch_name: str, symbol: str, data: pd.DataFrame):
+        """记录某个接口分支的命中结果。"""
+        logger.warning(f"{market}指数 {normalized_code} 命中 {branch_name}(symbol={symbol})，返回 {len(data)} 条记录")
+
+    def _build_a_index_symbols(self, normalized_code: str) -> List[str]:
+        """构造 A 股指数在不同接口下可尝试的 symbol 列表。"""
+        symbols = []
+
+        # 通过配置推断市场后缀
+        if self.config:
+            with_suffix = self.config.get_index_with_suffix(normalized_code)
+            if with_suffix != normalized_code and '.' in with_suffix:
+                market = with_suffix.split('.')[-1].lower()
+                if market in {'sh', 'ss'}:
+                    symbols.append(f"sh{normalized_code}")
+                elif market in {'sz', 'xshe'}:
+                    symbols.append(f"sz{normalized_code}")
+                elif market == 'bj':
+                    symbols.append(f"bj{normalized_code}")
+
+        # 中证指数常见前缀
+        if re.fullmatch(r"\d{6}", normalized_code):
+            symbols.extend([
+                f"csi{normalized_code}",
+                f"sh{normalized_code}",
+                f"sz{normalized_code}",
+                normalized_code,
+            ])
+        else:
+            symbols.append(normalized_code)
+
+        # 去重并保持顺序
+        dedup_symbols = []
+        for s in symbols:
+            if s and s not in dedup_symbols:
+                dedup_symbols.append(s)
+        return dedup_symbols
+
+    def _fetch_a_share_index_data(self, normalized_code: str, start_date: str, end_date: str) -> Optional[pd.DataFrame]:
+        """A 股指数抓取：优先东财历史接口，失败后回退到通用/腾讯/新浪。"""
+        symbols = self._build_a_index_symbols(normalized_code)
+
+        # 1) 文档推荐：东财历史行情
+        for symbol in symbols:
+            self._log_branch_attempt("A股", normalized_code, "stock_zh_index_daily_em", symbol)
+            try:
+                data = self._fetch_with_retries(
+                    ak.stock_zh_index_daily_em,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    retries=3,
+                )
+                if data is not None and not data.empty:
+                    self._log_branch_success("A股", normalized_code, "stock_zh_index_daily_em", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"stock_zh_index_daily_em(symbol={symbol}) 失败: {e}")
+
+        # 2) 通用接口：不带市场前缀的6位代码
+        self._log_branch_attempt("A股", normalized_code, "index_zh_a_hist", normalized_code)
+        try:
+            data = self._fetch_with_retries(
+                ak.index_zh_a_hist,
+                symbol=normalized_code,
+                period="daily",
+                start_date=start_date,
+                end_date=end_date,
+                retries=3,
+            )
+            if data is not None and not data.empty:
+                self._log_branch_success("A股", normalized_code, "index_zh_a_hist", normalized_code, data)
+                return data
+        except Exception as e:
+            logger.warning(f"index_zh_a_hist(symbol={normalized_code}) 失败: {e}")
+
+        # 3) 腾讯接口回退
+        for symbol in symbols:
+            if not (symbol.startswith('sh') or symbol.startswith('sz')):
+                continue
+            self._log_branch_attempt("A股", normalized_code, "stock_zh_index_daily_tx", symbol)
+            try:
+                data = self._fetch_with_retries(
+                    ak.stock_zh_index_daily_tx,
+                    symbol=symbol,
+                    start_date=start_date,
+                    end_date=end_date,
+                    retries=2,
+                )
+                if data is not None and not data.empty:
+                    self._log_branch_success("A股", normalized_code, "stock_zh_index_daily_tx", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"stock_zh_index_daily_tx(symbol={symbol}) 失败: {e}")
+
+        # 4) 新浪接口兜底
+        for symbol in symbols:
+            if not (symbol.startswith('sh') or symbol.startswith('sz')):
+                continue
+            self._log_branch_attempt("A股", normalized_code, "stock_zh_index_daily", symbol)
+            try:
+                data = self._fetch_with_retries(ak.stock_zh_index_daily, symbol=symbol, retries=2)
+                if data is not None and not data.empty:
+                    self._log_branch_success("A股", normalized_code, "stock_zh_index_daily", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"stock_zh_index_daily(symbol={symbol}) 失败: {e}")
+
+        return None
+
+    def _fetch_hk_index_data(self, normalized_code: str) -> Optional[pd.DataFrame]:
+        """港股指数抓取：优先新浪历史，失败后回退到东财历史/全球指数历史。"""
+        hk_symbols = [normalized_code, "HSI", "恒生指数"] if normalized_code == 'HSI' else [normalized_code]
+
+        # 1) 文档推荐：新浪港股指数历史
+        for symbol in hk_symbols:
+            self._log_branch_attempt("港股", normalized_code, "stock_hk_index_daily_sina", symbol)
+            try:
+                data = self._fetch_with_retries(ak.stock_hk_index_daily_sina, symbol=symbol, retries=3)
+                if data is not None and not data.empty:
+                    self._log_branch_success("港股", normalized_code, "stock_hk_index_daily_sina", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"stock_hk_index_daily_sina(symbol={symbol}) 失败: {e}")
+
+        # 2) 东财港股指数历史
+        for symbol in hk_symbols:
+            self._log_branch_attempt("港股", normalized_code, "stock_hk_index_daily_em", symbol)
+            try:
+                data = self._fetch_with_retries(ak.stock_hk_index_daily_em, symbol=symbol, retries=2)
+                if data is not None and not data.empty:
+                    self._log_branch_success("港股", normalized_code, "stock_hk_index_daily_em", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"stock_hk_index_daily_em(symbol={symbol}) 失败: {e}")
+
+        # 3) 全球指数历史兜底
+        for symbol in hk_symbols:
+            self._log_branch_attempt("港股", normalized_code, "index_global_hist_em", symbol)
+            try:
+                data = self._fetch_with_retries(ak.index_global_hist_em, symbol=symbol, retries=2)
+                if data is not None and not data.empty:
+                    self._log_branch_success("港股", normalized_code, "index_global_hist_em", symbol, data)
+                    return data
+            except Exception as e:
+                logger.warning(f"index_global_hist_em(symbol={symbol}) 失败: {e}")
+
+        return None
     
     def fetch_index_data(self, index_code: str, 
                         start_date: Optional[str] = None, 
@@ -83,52 +254,19 @@ class IndexDataFetcher:
             if not end_date:
                 end_date = datetime.now().strftime('%Y%m%d')
             
-            index_data = None
-            
-            # 根据指数代码选择不同的接口
+            # 根据指数代码选择不同的接口（含重试与多级回退）
             if normalized_code == 'HSI':
-                # 港股指数
-                for symbol in ["HSI", "恒生指数"]:
-                    try:
-                        index_data = ak.stock_hk_index_daily_em(symbol=symbol)
-                        break
-                    except Exception as e:
-                        logger.warning(f"使用 stock_hk_index_daily_em 获取 {symbol} 失败: {e}")
-
+                logger.info(f"港股指数 {normalized_code} 进入分支回退链: stock_hk_index_daily_sina -> stock_hk_index_daily_em -> index_global_hist_em")
+                index_data = self._fetch_hk_index_data(normalized_code)
                 if index_data is None:
                     logger.error(f"获取港股指数 {normalized_code} 所有方法都失败")
                     return None
             else:
-                # A股指数
-                try:
-                    # 尝试主要接口
-                    index_data = ak.index_zh_a_hist(symbol=normalized_code, period="daily", 
-                                                  start_date=start_date, end_date=end_date)
-                except Exception as e:
-                    logger.warning(f"使用index_zh_a_hist获取指数 {normalized_code} 失败: {e}")
-                    # 尝试备选接口
-                    try:
-                        # 尝试带市场后缀的代码
-                        if self.config:
-                            index_with_suffix = self.config.get_index_with_suffix(normalized_code)
-                            if index_with_suffix != normalized_code:
-                                # 尝试去掉后缀的最后部分（如.SH -> sh）
-                                market_code = index_with_suffix.split('.')[-1].lower()
-                                if market_code == 'sh':
-                                    symbol = f"sh{normalized_code}"
-                                elif market_code == 'sz':
-                                    symbol = f"sz{normalized_code}"
-                                else:
-                                    symbol = normalized_code
-                            else:
-                                symbol = normalized_code
-                        else:
-                            symbol = normalized_code
-                        
-                        index_data = ak.stock_zh_index_daily_em(symbol=symbol)
-                    except Exception as e2:
-                        logger.error(f"获取A股指数 {normalized_code} 所有方法都失败: {e2}")
-                        return None
+                logger.info(f"A股指数 {normalized_code} 进入分支回退链: stock_zh_index_daily_em -> index_zh_a_hist -> stock_zh_index_daily_tx -> stock_zh_index_daily")
+                index_data = self._fetch_a_share_index_data(normalized_code, start_date, end_date)
+                if index_data is None:
+                    logger.error(f"获取A股指数 {normalized_code} 所有方法都失败")
+                    return None
             
             if index_data is None or index_data.empty:
                 logger.warning(f"指数 {normalized_code} 没有获取到数据")
@@ -173,6 +311,8 @@ class IndexDataFetcher:
             
             # 确保日期列为datetime类型
             index_data['date'] = pd.to_datetime(index_data['date'])
+            index_data['close'] = pd.to_numeric(index_data['close'], errors='coerce')
+            index_data = index_data.dropna(subset=['date', 'close']).copy()
             
             # 筛选指定日期范围内的数据
             index_data = index_data[

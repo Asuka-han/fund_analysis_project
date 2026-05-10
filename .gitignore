@@ -6,5 +6,12 @@ dist/
 specs/
 reports/
 
-
+# PyInstaller 构建输出
+build/
+dist/
+*.spec
+*.pkg
+*.pyz
+__pycache__/
+*.pyc
 

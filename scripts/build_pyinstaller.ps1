@@ -38,13 +38,45 @@ $commonArgs = @(
     "--collect-all", "matplotlib",
     "--collect-all", "plotly",
     "--collect-all", "pandas",
+    "--collect-all", "numpy",
+    "--collect-all", "scipy",
     "--collect-submodules", "akshare",
     "--hidden-import", "pytz",
     "--hidden-import", "dateutil.tz",
     "--copy-metadata", "pandas",
+    "--copy-metadata", "numpy",
+    "--copy-metadata", "scipy",
     "--copy-metadata", "plotly",
     "--copy-metadata", "matplotlib"
 )
+
+# 补齐 Windows + conda 下 oneMKL/OpenMP 运行时 DLL
+$libBinCandidates = @()
+if ($env:CONDA_PREFIX) {
+    $libBinCandidates += (Join-Path $env:CONDA_PREFIX "Library\bin")
+}
+$libBinCandidates += (Join-Path $env:VIRTUAL_ENV "Library\bin")
+
+$patterns = @(
+    "mkl*.dll",           # 匹配所有 mkl 开头的 dll
+    "libiomp5md.dll",     # Intel OpenMP 运行时
+    "tbb*.dll",           # 可选，Intel TBB
+    "svml_dispmd.dll"     # Intel SVML
+)
+
+$seen = @{}
+foreach ($libBin in $libBinCandidates) {
+    if (-not $libBin -or -not (Test-Path $libBin)) { continue }
+    foreach ($pattern in $patterns) {
+        Get-ChildItem $libBin -Filter $pattern -File -ErrorAction SilentlyContinue | ForEach-Object {
+            if (-not $seen.ContainsKey($_.FullName)) {
+                $seen[$_.FullName] = $true
+                $commonArgs += "--add-binary"
+                $commonArgs += ("{0};." -f $_.FullName)
+            }
+        }
+    }
+}
 
 if ($NoConsole) {
     $commonArgs += "--noconsole"
